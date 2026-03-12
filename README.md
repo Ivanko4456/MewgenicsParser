@@ -2,9 +2,9 @@
 
 Установка зависимостей:
 ```bash
-    pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 Использование:
 ```bash
-    python main.py
+python main.py
 ```
