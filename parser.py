@@ -1,14 +1,10 @@
 """
 Основной парсер сохранений Mewgenics.
-Теперь использует раздельные базы мутаций по частям тела.
 """
-import os
-import sqlite3
 import struct
 import lz4.block
-from typing import Optional
 from binary_reader import BinaryReader
-from mutations import MUTATION_DB_BY_PART
+from mutations import MUTATION_DB_BY_PART, CLASS_BONUSES
 
 STAT_NAMES = ["STR", "DEX", "CON", "INT", "SPD", "CHA", "LCK"]
 
@@ -52,29 +48,18 @@ def decompress_cat_blob(wrapped: bytes) -> bytes:
 
 
 def calculate_mutation_bonuses(visual_mutations: list[tuple[str, int]]) -> list[int]:
-    """
-    Рассчитывает бонусы статов от визуальных мутаций.
-
-    Args:
-        visual_mutations: список кортежей (part_key, mutation_id)
-
-    Returns:
-        Список из 7 значений бонусов [STR, DEX, CON, INT, SPD, CHA, LCK]
-    """
+    """Рассчитывает бонусы статов от визуальных мутаций."""
     bonuses = [0] * 7
 
     for part_key, mut_id in visual_mutations:
-        # Получаем базу данных для этой части тела
         part_db = MUTATION_DB_BY_PART.get(part_key)
 
         if part_db and mut_id in part_db:
-            # Нашли мутацию в базе для этой части тела
             mut_info = part_db[mut_id]
             for stat_idx, bonus_value in mut_info["bonuses"].items():
                 if 0 <= stat_idx < 7:
                     bonuses[stat_idx] += bonus_value
         elif 400 <= mut_id <= 442:
-            # Универсальные стат-мутации (400-442) работают на любой части тела
             for db in MUTATION_DB_BY_PART.values():
                 if mut_id in db:
                     mut_info = db[mut_id]
@@ -86,6 +71,24 @@ def calculate_mutation_bonuses(visual_mutations: list[tuple[str, int]]) -> list[
     return bonuses
 
 
+def clean_gender(gender_str: str | None) -> str:
+    """Очищает название пола от цифр и технических символов."""
+    if not gender_str:
+        return "?"
+
+    g = gender_str.strip().lower()
+    g = ''.join(c for c in g if c.isalpha())
+
+    if g.startswith("male"):
+        return "male"
+    if g.startswith("female"):
+        return "female"
+    if g in ("spidercat", "ditto", "unknown"):
+        return "?"
+
+    return "?" if not g else g
+
+
 class Cat:
     """Представление кота из сохранения."""
 
@@ -94,7 +97,7 @@ class Cat:
         self.name = "Unknown"
         self.gender = "Unknown"
 
-        # Проверка статуса кота
+        # Статус кота
         self.inHouse = cat_key in house_info
         self.onAdventure = cat_key in adventure_keys
 
@@ -113,8 +116,16 @@ class Cat:
         self.final_stats = {name: 0 for name in STAT_NAMES}
         self.bonus_stats = {name: 0 for name in STAT_NAMES}
         self.mutation_bonuses = [0] * 7
+        self.class_bonuses = [0] * 7
         self.visual_mutations: list[tuple[str, int]] = []
+        self.class_name = "Colorless"
+        
+        # Статы (распределение, модификаторы, вторичные)
+        self.stat_allocations = [0] * 7
+        self.stat_modifiers = [0] * 7
+        self.stat_secondary = [0] * 7
 
+        # Распаковка данных
         try:
             self.decompressed_data = decompress_cat_blob(blob)
         except Exception:
@@ -150,28 +161,79 @@ class Cat:
 
         reader.skip(12)
 
-        # Чтение и очистка пола
-        self.gender = clean_gender(reader.str())
-        reader.f64()  # ← Теперь работает!
+        # Пол/голос: структура может быть u32 flag + u64 len + string ИЛИ u64 len + string
+        try:
+            # Сохраняем позицию
+            pos_before = reader.pos
+            
+            # Пробуем прочитать u32 flag
+            flag = reader.u32()
+            gender_len = reader.u64()
+            
+            # Если длина разумная (< 100), читаем строку
+            if 0 < gender_len < 100:
+                gender_str = self.decompressed_data[reader.pos:reader.pos+gender_len].decode('utf-8', errors='ignore')
+                reader.pos += int(gender_len)
+                self.gender = clean_gender(gender_str)
+            else:
+                # Неверная длина, откатываемся и пробуем без flag
+                reader.pos = pos_before
+                gender_len = reader.u64()
+                if 0 < gender_len < 100:
+                    gender_str = self.decompressed_data[reader.pos:reader.pos+gender_len].decode('utf-8', errors='ignore')
+                    reader.pos += int(gender_len)
+                    self.gender = clean_gender(gender_str)
+                else:
+                    self.gender = "?"
+        except:
+            self.gender = "?"
+
+        # Возраст (f64)
+        try:
+            reader.f64()
+        except:
+            pass
 
         # Статы
-        self.stat_allocations = [reader.u32() for _ in range(7)]
-        self.stat_modifiers = [reader.i32() for _ in range(7)]
-        self.stat_secondary = [reader.i32() for _ in range(7)]
+        try:
+            self.stat_allocations = [reader.u32() for _ in range(7)]
+            self.stat_modifiers = [reader.i32() for _ in range(7)]
+            self.stat_secondary = [reader.i32() for _ in range(7)]
+        except:
+            pass
+
+        # === Поиск класса кота в данных ===
+        # Ищем известные названия классов в байтах
+        self.class_name = "Colorless"  # класс по умолчанию
+        
+        known_classes = [b"Fighter", b"Hunter", b"Mage", b"Medic", b"Tank", b"Thief", b"Colorless"]
+        for class_bytes in known_classes:
+            pos = self.decompressed_data.find(class_bytes)
+            if pos != -1:
+                self.class_name = class_bytes.decode('utf-8')
+                break
+
+        # === Применение бонусов класса ===
+        self.class_bonuses = [0] * 7
+        if self.class_name in CLASS_BONUSES:
+            for stat_idx, bonus in CLASS_BONUSES[self.class_name]["bonuses"].items():
+                if 0 <= stat_idx < 7:
+                    self.class_bonuses[stat_idx] = bonus
 
         # Расчёт бонусов от мутаций
-        self.mutation_bonuses = calculate_mutation_bonuses(self.visual_mutations)
+        mutation_bonuses = calculate_mutation_bonuses(self.visual_mutations)
 
-        # Финальный расчёт статов
+        # === Финальный расчёт статов ===
         for i, name in enumerate(STAT_NAMES):
             base = self.stat_allocations[i]
             mod = self.stat_modifiers[i]
-            mut = self.mutation_bonuses[i]
+            mut = mutation_bonuses[i]
+            cls = self.class_bonuses[i]  # Бонусы класса
             sec = self.stat_secondary[i]
 
             self.base_stats[name] = base
-            self.bonus_stats[name] = mod + mut + sec
-            self.final_stats[name] = base + mod + mut + sec
+            self.bonus_stats[name] = mod + mut + cls + sec
+            self.final_stats[name] = base + mod + mut + cls + sec
 
         # Навыки
         self.abilities = []
@@ -182,6 +244,7 @@ class Cat:
         return {
             'ID': self.db_key,
             'Имя': self.name or 'Unknown',
+            'Класс': self.class_name,
             'В доме': 'Да' if self.inHouse else 'Нет',
             'Комната': self.room,
             'Пол': self.gender,
@@ -190,138 +253,3 @@ class Cat:
             **{f'Bonus_{name}': self.bonus_stats[name] if self.bonus_stats[name] != 0 else ''
                for name in STAT_NAMES},
         }
-
-
-def clean_gender(gender_str):
-    """Очищает название пола от цифр и технических символов."""
-    if not gender_str:
-        return "?"
-
-    g = gender_str.strip().lower()
-    g = ''.join(c for c in g if c.isalpha())
-
-    if g.startswith("male"):
-        return "male"
-    if g.startswith("female"):
-        return "female"
-    if g == "spidercat" or g == "ditto":
-        return "?"
-
-    return "?" if not g else g
-
-
-def get_house_info(conn) -> dict:
-    """Получить информацию о комнатах котов."""
-    house_info = {}
-    try:
-        row = conn.execute("SELECT data FROM files WHERE key = 'house_state'").fetchone()
-        if not row or len(row[0]) < 8:
-            return house_info
-        data = row[0]
-        count = struct.unpack_from('<I', data, 4)[0]
-        pos = 8
-        for _ in range(count):
-            if pos + 8 > len(data):
-                break
-            cat_key = struct.unpack_from('<I', data, pos)[0]
-            pos += 8
-            room_len = struct.unpack_from('<I', data, pos)[0]
-            pos += 8
-            room_name = ""
-            if room_len > 0:
-                room_name = data[pos:pos + room_len].decode('ascii', errors='ignore')
-                pos += room_len
-            pos += 24
-            house_info[cat_key] = room_name
-    except Exception:
-        pass
-    return house_info
-
-
-def get_adventure_keys(conn) -> set:
-    """Получить ключи котов на приключении."""
-    keys = set()
-    try:
-        row = conn.execute("SELECT data FROM files WHERE key = 'adventure_state'").fetchone()
-        if not row or len(row[0]) < 8:
-            return keys
-        data = row[0]
-        count = struct.unpack_from('<I', data, 4)[0]
-        pos = 8
-        for _ in range(count):
-            if pos + 8 > len(data):
-                break
-            val = struct.unpack_from('<Q', data, pos)[0]
-            pos += 8
-            cat_key = (val >> 32) & 0xFFFF_FFFF
-            if cat_key:
-                keys.add(cat_key)
-    except Exception:
-        pass
-    return keys
-
-
-def find_save_file() -> str | None:
-    """Автоматический поиск файла сохранения."""
-    home = os.path.expanduser('~')
-    possible_bases = [
-        os.path.join(home, 'AppData', 'Roaming', 'Glaiel Games', 'Mewgenics'),
-        os.path.join(home, 'AppData', 'LocalLow', 'Kitfox Games', 'Mewgenics'),
-        os.path.join(home, 'AppData', 'LocalLow', 'Glaiel Games', 'Mewgenics'),
-        os.path.join(home, 'AppData', 'Roaming', 'Kitfox Games', 'Mewgenics'),
-    ]
-
-    for base_path in possible_bases:
-        if os.path.exists(base_path):
-            try:
-                folders = [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
-                for folder in folders:
-                    if folder.isdigit() and len(folder) > 10:
-                        save_path = os.path.join(base_path, folder, 'saves', 'steamcampaign01.sav')
-                        if os.path.exists(save_path):
-                            return save_path
-            except Exception:
-                continue
-    return None
-
-
-def parse_all(path: str) -> list[dict]:
-    """Парсинг всех котов из сохранения."""
-    if not os.path.exists(path):
-        print(f"❌ Файл не найден: {path}")
-        return []
-
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        print("✓ Подключение к базе данных успешно")
-    except sqlite3.DatabaseError as e:
-        print(f"❌ Ошибка: не является базой данных SQLite ({e})")
-        return []
-
-    house_info = get_house_info(conn)
-    adventure_keys = get_adventure_keys(conn)
-    rows = conn.execute("SELECT key, data FROM cats").fetchall()
-    print(f"📦 Найдено записей о кошках: {len(rows)}")
-
-    cats = []
-    success = 0
-    failed = 0
-
-    for key, blob in rows:
-        try:
-            cat_obj = Cat(blob, key, house_info, adventure_keys)
-            if cat_obj.name and cat_obj.name != "Unknown":
-                cat_dict = cat_obj.to_dict()
-                cats.append(cat_dict)
-                success += 1
-            else:
-                failed += 1
-        except Exception as e:
-            failed += 1
-            print(f"[{key}] Ошибка: {e}")
-
-    conn.close()
-    print(f"✅ Успешно: {success}")
-    print(f"❌ Ошибки: {failed}")
-
-    return cats

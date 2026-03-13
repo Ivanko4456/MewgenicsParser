@@ -36,7 +36,7 @@ class BinaryReader:
         return low + (high * 4_294_967_296)
 
     def f64(self) -> float:
-        """Read 64-bit float (little-endian). ← ЭТОГО НЕ ХВАТАЛО!"""
+        """Read 64-bit float (little-endian)."""
         val = struct.unpack_from('<d', self.data, self.pos)[0]
         self.pos += 8
         return val
