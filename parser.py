@@ -8,6 +8,9 @@ from mutations import MUTATION_DB_BY_PART, CLASS_BONUSES
 
 STAT_NAMES = ["STR", "DEX", "CON", "INT", "SPD", "CHA", "LCK"]
 
+# Парные части тела (бонусы делятся пополам)
+PAIRED_PARTS = {"ears", "eyebrows", "eyes", "legs"}
+
 # Маппинг: индекс в T-массиве → ключ части тела
 MUTATION_SLOT_TO_PART = {
     0: "texture",
@@ -58,6 +61,9 @@ def calculate_mutation_bonuses(visual_mutations: list[tuple[str, int]]) -> list[
             mut_info = part_db[mut_id]
             for stat_idx, bonus_value in mut_info["bonuses"].items():
                 if 0 <= stat_idx < 7:
+                    # Для парных частей тела бонусы делятся пополам
+                    if part_key in PAIRED_PARTS:
+                        bonus_value /= 2
                     bonuses[stat_idx] += bonus_value
         elif 400 <= mut_id <= 442:
             for db in MUTATION_DB_BY_PART.values():
@@ -65,6 +71,9 @@ def calculate_mutation_bonuses(visual_mutations: list[tuple[str, int]]) -> list[
                     mut_info = db[mut_id]
                     for stat_idx, bonus_value in mut_info["bonuses"].items():
                         if 0 <= stat_idx < 7:
+                            # Для парных частей тела бонусы делятся пополам
+                            if part_key in PAIRED_PARTS:
+                                bonus_value /= 2
                             bonuses[stat_idx] += bonus_value
                     break
 
