@@ -1,10 +1,11 @@
 # Парсер котов для Mewgenics
 
-Установка зависимостей:
+### Установка зависимостей:
 ```bash
 pip install -r requirements.txt
 ```
-Использование:
+Или запустите файл setup.bat
+### Использование:
 ```bash
 python main.py
 ```
